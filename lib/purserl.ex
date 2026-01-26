@@ -42,8 +42,8 @@ defmodule Purserl do
       purs_cmd: config |> Keyword.get(:purs_cmd, nil),
       extract_cmd: config |> Keyword.get(:purs_cmd, "") == "",
       purs_args: config |> Keyword.get(:purs_args, ""),
-      ctx_lines_above: config |> Keyword.get(:ctx_lines_above, 3) |> (fn x -> x + 1 end).(),
-      ctx_lines_below: config |> Keyword.get(:ctx_lines_below, 3) |> (fn x -> x + 1 end).(),
+      ctx_lines_above: config |> Keyword.get(:ctx_lines_above, 3),
+      ctx_lines_below: config |> Keyword.get(:ctx_lines_below, 3),
       logfile:
         case config |> Keyword.get(:logfile_path, nil) do
           nil ->
@@ -1109,7 +1109,7 @@ defmodule Purserl do
         modu = Color.magenta() <> (module_name || filename) <> Color.reset()
 
         max_lines_of_context =
-          System.get_env("PURERLEX_MAX_LINES_OF_CONTEXT", "3")
+          System.get_env("PURERLEX_MAX_LINES_OF_CONTEXT", "10")
           |> String.trim_trailing()
           |> String.to_integer()
 
@@ -1131,59 +1131,37 @@ defmodule Purserl do
                 "start" => [start_line, start_column],
                 "end" => [end_line, end_column]
               } ->
-                snippet =
-                  parse_out_span(%{
-                    :file_contents_before => old_content,
-                    :start_line => start_line,
-                    :start_column => start_column,
-                    :end_line => end_line,
-                    :end_column => end_column
-                  })
+                lines = old_content |> String.split("\n")
 
-                snippet_context_pre =
-                  ((snippet["prefix_lines"]
-                    |> String.split("\n")
-                    |> Enum.reverse()
-                    |> Enum.take(state.ctx_lines_above)
-                    |> Enum.reverse()
-                    |> Enum.join("\n")) <>
-                     snippet["prefix_columns"])
-                  |> String.trim_leading("\n")
+                pre = lines |> Enum.slice(0..(start_line - 2)//1) |> Enum.take(-state.ctx_lines_above)
+                focus = lines |> Enum.slice((start_line - 1)..(end_line - 1)//1)
+                post = lines |> Enum.slice(end_line..length(lines)//1) |> Enum.take(state.ctx_lines_below)
 
-                snippet_actual =
-                  snippet["infix_lines"] <>
-                    snippet["infix_columns"]
+                prefix = get_common_line_prefix(pre ++ Enum.take(focus ++ post, max_lines_of_context))
 
-                snippet_context_post =
-                  (snippet["suffix_columns"] <>
-                     (snippet["suffix_lines"]
-                      |> String.split("\n")
-                      |> Enum.take(state.ctx_lines_below)
-                      |> Enum.join("\n")))
-                  |> String.trim_trailing()
-
-                common_prefix =
-                  get_common_line_prefix(
-                    snippet_context_pre <> snippet_actual <> snippet_context_post
-                  )
+                focus =
+                  case length(focus) do
+                    0 -> []
+                    1 ->
+                      focus
+                      |> List.update_at(0, fn s ->
+                        {init, aftr} = String.split_at(s, end_column)
+                        {before, middle} = String.split_at(init, start_column - 1)
+                        before <> Color.yellow() <> middle <> Color.reset() <> aftr
+                      end)
+                    _ ->
+                      first = List.first(focus) |> then(fn s -> {before, aftr} = String.split_at(s, start_column - 1); before <> Color.yellow() <> aftr <> Color.reset() end)
+                      middle = focus |> Enum.slice(1..-2//1) |> Enum.map(fn s -> Color.yellow() <> s <> Color.reset() end)
+                      last = List.last(focus) |> then(fn s -> {before, aftr} = String.split_at(s, end_column); Color.yellow() <> before <> Color.reset() <> aftr  end)
+                      [first] ++ middle ++ [last]
+                  end
 
                 code_snippet_with_context =
-                  ((snippet_context_pre
-                    |> take_lines(-Integer.floor_div(max_lines_of_context, 2))
-                    |> strip_prefix_all_lines(common_prefix)
-                    |> prefix_all_lines(" ")) <>
-                     (Color.yellow() <>
-                        (snippet_actual
-                         |> strip_prefix_all_lines(common_prefix)
-                         |> prefix_lines_skipping_first(" ")) <> Color.reset()) <>
-                     (snippet_context_post
-                      |> strip_prefix_all_lines(common_prefix)
-                      |> prefix_all_lines(" ")))
-                  |> take_lines(max_lines_of_context)
+                  (pre ++ Enum.take(focus ++ post, max_lines_of_context))
+                  |> Enum.map(fn l -> Color.yellow() <> "  | " <> Color.reset() <> String.replace(l, prefix, "", global: false) end)
+                  |> Enum.join("\n")
 
-                ("  " <> format_path_with_line(filename, start_line) <> "\n") <>
-                  (code_snippet_with_context
-                   |> prefix_all_lines(Color.yellow() <> "  | " <> Color.reset()))
+                "  " <> format_path_with_line(filename, start_line) <> "\n" <> code_snippet_with_context
 
               _ ->
                 runtime_bug(
@@ -1276,20 +1254,13 @@ defmodule Purserl do
     end
   end
 
-  def get_common_line_prefix(things) when is_binary(things) do
-    if things == "" do
-      ""
-    else
-      get_common_line_prefix(things |> String.split("\n"))
-    end
-  end
-
-  def get_common_line_prefix(things, count \\ 1) when is_list(things) do
+  def get_common_line_prefix(things, count \\ 1)
+  def get_common_line_prefix([], _), do: ""
+  def get_common_line_prefix(things, count) when is_list(things) do
+    p = (for _ <- 0..(count - 1)//1, do: " ") |> Enum.join("")
     prefixes =
       things
-      |> Enum.map(fn s -> String.slice(s, 0, count) end)
-      # only looking at spaces here, to avoid dropping useful code
-      |> Enum.filter(fn x -> String.trim_leading(x, " ") == "" end)
+      |> Enum.filter(fn x -> x |> String.starts_with?(p) end)
       |> length()
 
     case prefixes == length(things) do
@@ -1297,8 +1268,7 @@ defmodule Purserl do
         get_common_line_prefix(things, count + 1)
 
       false ->
-        [thing | _] = things
-        String.slice(thing, 0, count - 1)
+        p |> String.slice(0..-2//1)
     end
   end
 
