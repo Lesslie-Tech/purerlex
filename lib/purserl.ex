@@ -548,8 +548,14 @@ defmodule Purserl do
     # to the file names.
     available_modules =
       for file <- Path.wildcard(state.purs_files) do
-        [_, _, module] = Regex.run(~r/(^|\n)module\s+(\S+)/, File.read!(file))
-        {module, file}
+        case Regex.run(~r/(^|\n)module\s+(\S+)/, File.read!(file)) do
+          [_, _, module] ->
+            {module, file}
+
+          _ ->
+            IO.puts(:stderr, "purerlex: failed to find PureScript module declaration in #{file}")
+            raise CompileError, file: file, description: "failed to find PureScript module declaration"
+        end
       end
       |> Enum.into(%{})
 
