@@ -97,7 +97,7 @@ defmodule Purserl do
     # files |> Enum.map(fn x -> compile_erlang(x) end)
     # IO.inspect({:done_prebuild_erlc, files})
 
-    {:ok, state} = if state.purs_cmd == nil do
+    state = if state.purs_cmd == nil do
       start_spago(state)
     else
       run_purs(state)
@@ -138,8 +138,7 @@ defmodule Purserl do
         state
       )
 
-    state = %{state | port: port}
-    {:ok, state}
+    %{state | port: port}
   end
 
   def run_purs(state) do
@@ -155,8 +154,7 @@ defmodule Purserl do
         ],
         state
       )
-
-    {:ok, %{state | port: port}}
+    %{state | port: port}
   end
 
   # logging wrappers
@@ -289,7 +287,7 @@ defmodule Purserl do
         port_close(state.port, state)
 
         {:ok, cmd} = extract_purs_cmd(msg)
-        {:ok, state} = run_purs(%{state | port: nil, purs_cmd: cmd})
+        state = run_purs(%{state | purs_cmd: cmd})
         {:noreply, state}
 
       state.purs_cmd == nil ->
@@ -473,6 +471,13 @@ defmodule Purserl do
     state = strip_errors(state)
     print_elapsed(state)
     state = state |> reply(result)
+    state =
+      case System.get_env("PURERLEX_REDUCE_MEMORY") do
+        nil -> state
+        _ ->
+          Port.close(state.port)
+          run_purs(state)
+      end
     trigger_additional_recompiles(state)
     {:noreply, %{state | is_compiling: false}}
   end
