@@ -538,7 +538,11 @@ defmodule Purserl do
   end
 
   def handle_call(:error_cache, _from, state) do
-    {:reply, warnings_to_string(state), state}
+    {:reply, warnings_to_string(state, false, false), state}
+  end
+
+  def handle_call(:error_cache_terse, _from, state) do
+    {:reply, warnings_to_string(state, true, false), state}
   end
 
   def handle_call(:compile_times, _from, state) do
@@ -871,7 +875,7 @@ defmodule Purserl do
     end
   end
 
-  def warnings_to_string(state) do
+  def warnings_to_string(state, terse \\ false, color \\ false) do
     things = load_warning_cache(state.logfile, state.build_error_cache_path)
              |> Map.merge(state.previous_errors, fn _, a, b -> a ++ b end)
              |> Map.values()
@@ -879,7 +883,7 @@ defmodule Purserl do
              |> Enum.uniq() # |> IO.inspect(label: "things3")
 
     {:ok, pid} = StringIO.open("")
-    process_warnings_impl(state, things, :done, pid)
+    process_warnings_impl(state, things, :done, pid, terse, color)
     {:ok, {_, output}} = StringIO.close(pid)
     String.trim(output)
   end
@@ -912,7 +916,7 @@ defmodule Purserl do
     end
   end
 
-  def process_warnings_impl(state, things, done_or_wip, device) do
+  def process_warnings_impl(state, things, done_or_wip, device, terse \\ nil, color \\ true) do
     # warnings = [
     #  %{
     #    "allSpans" => [
@@ -1042,7 +1046,11 @@ defmodule Purserl do
     reverse_sorted_applications
     |> Enum.map(fn x -> apply_suggestion(x, state) end)
 
-    terse = not Enum.member?(["", "0", "false"], System.get_env("PURERLEX_TERSE", ""))
+    terse =
+      case terse do
+        nil -> not Enum.member?(["", "0", "false"], System.get_env("PURERLEX_TERSE", ""))
+        _ -> terse
+      end
 
     to_print =
       with_file_contents
@@ -1055,24 +1063,19 @@ defmodule Purserl do
             []
 
           :warn_fixable ->
-            [{x, format_warning_or_error(state, terse, :warn_fixable, x)}]
+            [{x, format_warning_or_error(state, terse, color, :warn_fixable, x)}]
 
           :warn_no_autofix ->
-            [{x, format_warning_or_error(state, terse, :warn_no_autofix, x)}]
+            [{x, format_warning_or_error(state, terse, color, :warn_no_autofix, x)}]
 
           :error ->
-            [{x, format_warning_or_error(state, terse, :error, x)}]
+            [{x, format_warning_or_error(state, terse, color, :error, x)}]
         end
       end)
 
-    to_print_chunked =
-      to_print
-      |> Enum.chunk_by(fn {x, _} -> x["filename"] end)
-
-    to_print_chunked
+    to_print
+    |> Enum.chunk_by(fn {x, _} -> x["filename"] end)
     |> Enum.map(fn chunk ->
-      IO.puts(device, "")
-
       chunk
       |> Enum.map(fn {_, text} ->
         log("print_err_warn_to_stdout", {text}, state.logfile)
@@ -1086,9 +1089,17 @@ defmodule Purserl do
     prefix <> String.duplicate(pad, max(10, count)) <> suffix
   end
 
+  def c(color, style, text) do
+    IO.ANSI.format([style, text], color) |> IO.iodata_to_binary()
+  end
+
+  def strip_ansi_unless(text, true), do: text
+  def strip_ansi_unless(text, false), do: String.replace(text, ~r/\e\[[0-9;]*m/, "")
+
   def format_warning_or_error(
         state,
         terse,
+        color,
         kind,
         inp
       ) do
@@ -1117,7 +1128,7 @@ defmodule Purserl do
         },
         "suggestion" => _
       } ->
-        modu = Color.magenta() <> (module_name || filename) <> Color.reset()
+        modu = c(color, :magenta, module_name || filename)
 
         max_lines_of_context =
           System.get_env("PURERLEX_MAX_LINES_OF_CONTEXT", "10")
@@ -1158,21 +1169,21 @@ defmodule Purserl do
                       |> List.update_at(0, fn s ->
                         {init, aftr} = String.split_at(s, end_column)
                         {before, middle} = String.split_at(init, start_column - 1)
-                        before <> Color.yellow() <> middle <> Color.reset() <> aftr
+                        before <> c(color, :yellow, middle) <> aftr
                       end)
                     _ ->
-                      first = List.first(focus) |> then(fn s -> {before, aftr} = String.split_at(s, start_column - 1); before <> Color.yellow() <> aftr <> Color.reset() end)
-                      middle = focus |> Enum.slice(1..-2//1) |> Enum.map(fn s -> Color.yellow() <> s <> Color.reset() end)
-                      last = List.last(focus) |> then(fn s -> {before, aftr} = String.split_at(s, end_column); Color.yellow() <> before <> Color.reset() <> aftr  end)
+                      first = List.first(focus) |> then(fn s -> {before, aftr} = String.split_at(s, start_column - 1); before <> c(color, :yellow, aftr) end)
+                      middle = focus |> Enum.slice(1..-2//1) |> Enum.map(fn s -> c(color, :yellow, s) end)
+                      last = List.last(focus) |> then(fn s -> {before, aftr} = String.split_at(s, end_column); c(color, :yellow, before) <> aftr  end)
                       [first] ++ middle ++ [last]
                   end
 
                 code_snippet_with_context =
                   (pre ++ Enum.take(focus ++ post, max_lines_of_context))
-                  |> Enum.map(fn l -> Color.yellow() <> "  | " <> Color.reset() <> String.replace(l, prefix, "", global: false) end)
+                  |> Enum.map(fn l -> c(color, :yellow, "  | ") <> String.replace(l, prefix, "", global: false) end)
                   |> Enum.join("\n")
 
-                "  " <> format_path_with_line(filename, start_line) <> "\n" <> code_snippet_with_context
+                "  " <> format_path_with_line(color, filename, start_line) <> "\n" <> code_snippet_with_context
 
               _ ->
                 runtime_bug(
@@ -1190,16 +1201,16 @@ defmodule Purserl do
           case kind do
             :warn_fixable ->
               if Enum.member?(["", "0", "false"], System.get_env("PURERLEX_FIX", "")) do
-                Color.yellow() <> "Fixable" <> Color.reset()
+                c(color, :yellow, "Fixable")
               else
-                Color.green() <> "Fixed" <> Color.reset()
+                c(color, :green, "Fixed")
               end
 
             :warn_no_autofix ->
-              Color.yellow() <> "Warning" <> Color.reset()
+              c(color, :yellow, "Warning")
 
             :error ->
-              Color.red() <> "Error" <> Color.reset()
+              c(color, :red, "Error")
 
             _ ->
               runtime_bug(
@@ -1216,16 +1227,16 @@ defmodule Purserl do
           case kind do
             :warn_fixable ->
               if Enum.member?(["", "0", "false"], System.get_env("PURERLEX_FIX", "")) do
-                Color.yellow() <> "X" <> Color.reset()
+                c(color, :yellow, "X")
               else
-                Color.green() <> "F" <> Color.reset()
+                c(color, :green, "F")
               end
 
             :warn_no_autofix ->
-              Color.yellow() <> "W" <> Color.reset()
+              c(color, :yellow, "W")
 
             :error ->
-              Color.red() <> "E" <> Color.reset()
+              c(color, :red, "E")
 
             _ ->
               runtime_bug(
@@ -1241,15 +1252,13 @@ defmodule Purserl do
         if terse do
           short_tag <>
             " " <>
-            Color.cyan() <>
-            error_code <> Color.reset() <> " " <> format_path_with_line(filename, start_line)
+            c(color, :cyan, error_code) <> " " <> format_path_with_line(color, filename, start_line)
         else
-          (Color.cyan() <>
-             error_code <> Color.reset() <> " " <> tag <> " " <> modu <> "\n") <>
+          (c(color, :cyan, error_code) <> " " <> tag <> " " <> modu <> "\n") <>
             "\n" <>
             Enum.join(snippets, "\n") <>
             "\n\n" <>
-            (message |> add_prefix_if_missing("  ") |> syntax_highlight_indentex_lines("    ")) <>
+            (message |> strip_ansi_unless(color) |> add_prefix_if_missing("  ") |> syntax_highlight_indentex_lines("    ")) <>
             "\n"
         end
 
@@ -1283,14 +1292,8 @@ defmodule Purserl do
     end
   end
 
-  def format_path_with_line(path, line) do
-    Color.magenta() <>
-      if line do
-        path <> ":" <> "#{line}"
-      else
-        path
-      end <>
-      Color.reset()
+  def format_path_with_line(color, path, line) do
+    c(color, :magenta, if(line, do: path <> ":" <> "#{line}", else: path))
   end
 
   def prefix_lines_skipping_first(str, prefix) do
