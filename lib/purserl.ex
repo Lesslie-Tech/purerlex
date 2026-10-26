@@ -636,9 +636,23 @@ defmodule Purserl do
       case sync_or_async do
         :sync ->
           ref = make_ref()
-          GenServer.cast(__MODULE__, {:recompile, {self(), ref}})
-          receive do
-            {^ref, res} -> res
+          # Monitor so we don't wait forever if purs dies and the GenServer goes down.
+          case GenServer.whereis(__MODULE__) do
+            nil ->
+              :err
+
+            pid ->
+              mon = Process.monitor(pid)
+              GenServer.cast(__MODULE__, {:recompile, {self(), ref}})
+
+              receive do
+                {^ref, res} ->
+                  Process.demonitor(mon, [:flush])
+                  res
+
+                {:DOWN, ^mon, :process, _, _} ->
+                  :err
+              end
           end
         :async ->
           spawn(fn -> GenServer.cast(__MODULE__, {:recompile, {self(), make_ref()}}) end)
