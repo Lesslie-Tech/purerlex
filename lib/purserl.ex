@@ -77,6 +77,8 @@ defmodule Purserl do
       build_cache: nil,
       available_modules: %{},
       tasks: [],
+      erl_error_count: 0,
+      erl_failed_modules: [],
       module_positions: %{},
       erl_steps: %{},
       started_at: nil,
@@ -452,6 +454,24 @@ defmodule Purserl do
     {:noreply, state}
   end
 
+  def handle_cast({:erl_error, errors}, state) do
+    things =
+      Enum.map(errors, fn x ->
+        # Not state.started_at: the .erl file is rewritten during this compile, and `cache/3` drops errors older than their file.
+        x |> Map.put(:kind, :error) |> Map.put(:start_compile_at, DateTime.utc_now())
+      end)
+
+    case state.build_error_cache_path do
+      nil -> process_warnings_impl(state, things, :wip, :stderr)
+      _ -> cache(state.logfile, state.build_error_cache_path, things)
+    end
+
+    failed = for %{"moduleName" => m} <- errors, m != nil, do: m
+
+    {:noreply, %{state | erl_error_count: state.erl_error_count + length(errors),
+                         erl_failed_modules: Enum.uniq(failed ++ state.erl_failed_modules)}}
+  end
+
   # NOTE[em]: For some reason we can get errors which aren't in a module?? This
   # has happened when trying to import somthing from a file which doesn't exist.
   # `import A (b)` <- If b doesn't exist.
@@ -466,10 +486,13 @@ defmodule Purserl do
     state =
       state
       |> update_beam_timestamps()
+      |> forget_erl_failed_modules()
       |> save_build_cache()
     process_warnings(state)
     state = strip_errors(state)
     print_elapsed(state)
+    # Erlang errors donesn't cause purs to fail, so we surface those issues here.
+    result = if result == :ok and state.erl_error_count > 0, do: :err, else: result
     state = state |> reply(result)
     state =
       case System.get_env("PURERLEX_REDUCE_MEMORY") do
@@ -518,6 +541,11 @@ defmodule Purserl do
 
     store_warning_cache(state.build_error_cache_path, warnings)
     %{state | previous_errors: errors }
+  end
+
+  # Errors aren't kept in the error cache between compiles (see strip_errors), so make the next compile see these modules as tampered; that purges and rebuilds them, re-running erlc and re-reporting the error.
+  defp forget_erl_failed_modules(state) do
+    %{state | build_cache: Map.drop(state.build_cache, state.erl_failed_modules)}
   end
 
   defp save_build_cache(state) do
@@ -604,6 +632,8 @@ defmodule Purserl do
     port_command(state.port, ~c"sdf\n", [], state)
 
     {:noreply, %{state | build_cache: build_cache,
+                         erl_error_count: 0,
+                         erl_failed_modules: [],
                          available_modules: available_modules,
                          started_at: started_at }}
   end
@@ -687,15 +717,29 @@ defmodule Purserl do
 
   ###
 
-  # Compiles and loads an Erlang source file, returns {module, binary}
+  # Compiles and loads an Erlang source file. Failures are reported to the
+  # GenServer as errors instead of raised, since this runs in a linked process.
   def compile_erlang(source, module_name, logfile, retries \\ 0) do
+    try do
+      do_compile_erlang(source, module_name, logfile, retries)
+    rescue
+      e ->
+        report_erlang_errors(source, module_name, [{1, 1, Exception.format(:error, e, __STACKTRACE__)}])
+    end
+
+    case module_name do
+      nil -> nil
+      _ -> GenServer.cast(__MODULE__, {:erl_step_complete, module_name})
+    end
+  end
+
+  defp do_compile_erlang(source, module_name, logfile, retries) do
     log("compile_erlang", {source, retries}, logfile)
 
     source = Path.relative_to_cwd(source) |> String.to_charlist()
 
     erlc_options = Mix.Project.config() |> Keyword.get(:erlc_options, [])
 
-    # st = DateTime.utc_now()
     case :compile.file(source, [:binary, :debug_info, :return_warnings, :return_errors] ++ erlc_options) do
       {:ok, module, binary, warnings} ->
         # NOTE[em]: When using the :binary option the compiler does not write
@@ -717,31 +761,62 @@ defmodule Purserl do
       err ->
         log("compile_erlang:not-ok", {source, retries, err}, logfile)
 
-        cond do
-          retries <= 10 ->
-            sleep_time = 100 + retries * 100
-            Process.sleep(sleep_time)
+        # Genuine compile errors are deterministic; only retry briefly in case we raced with the file being written.
+        max_retries = if match?({:error, _, _}, err), do: 2, else: 10
 
-            # IO.inspect {"purerlex: likely file system race condition, sleeping for #{sleep_time}ms before retrying erlc call"}
-            compile_erlang(source, module_name, logfile, retries + 1)
-
-          true ->
-            IO.puts("##########################################################")
-            IO.puts("####### Erl compiler failed to run; se error below #######")
-            IO.puts("##########################################################")
-            IO.puts("Source: #{inspect_full(source)}")
-            IO.puts("Retries: #{inspect_full(retries)}")
-            IO.puts("Err: #{inspect_full(err)}")
-
-            raise CompileError
+        if retries < max_retries do
+          sleep_time = 100 + retries * 100
+          Process.sleep(sleep_time)
+          do_compile_erlang(source, module_name, logfile, retries + 1)
+        else
+          report_erlang_errors(source, module_name, erlang_error_entries(err))
         end
     end
-    # IO.inspect({DateTime.diff(DateTime.utc_now(), st, :millisecond), source})
+  end
 
-    case module_name do
-      nil -> nil
-      _ -> GenServer.cast(__MODULE__, {:erl_step_complete, module_name})
-    end
+  # [{line, column, message}]
+  defp erlang_error_entries({:error, errors, _warnings}) do
+    entries =
+      for {_file, infos} <- errors, {location, mod, desc} <- infos do
+        {line, column} =
+          case location do
+            line when is_integer(line) -> {line, 1}
+            {line, column} -> {line, column}
+            _ -> {1, 1}
+          end
+
+        {max(line, 1), max(column, 1), IO.chardata_to_string(mod.format_error(desc))}
+      end
+
+    if entries == [], do: [{1, 1, "Erlang compiler failed with no error messages"}], else: entries
+  end
+
+  defp erlang_error_entries(err), do: [{1, 1, "Erlang compiler failed to run: " <> inspect_full(err)}]
+
+  # Reports the errors in the same shape as purs errors, so they get cached, printed with a source snippet, and fail the build.
+  defp report_erlang_errors(source, module_name, entries) do
+    file = source |> to_string() |> Path.relative_to_cwd()
+
+    errors =
+      for {line, column, message} <- entries do
+        %{
+          "allSpans" => [%{"name" => file, "start" => [line, column], "end" => [line, column]}],
+          "errorCode" => "ErlangCompileError",
+          "errorLink" => "",
+          "filename" => file,
+          "message" => "  " <> String.replace(message, "\n", "\n  ") <> "\n",
+          "moduleName" => module_name,
+          "position" => %{
+            "startLine" => line,
+            "startColumn" => column,
+            "endLine" => line,
+            "endColumn" => column
+          },
+          "suggestion" => nil
+        }
+      end
+
+    GenServer.cast(__MODULE__, {:erl_error, errors})
   end
 
   def inspect_full(contents, opts \\ []) do
@@ -1996,6 +2071,9 @@ defmodule Purserl do
         :error
 
       %{"errorCode" => "CannotApplyExpressionOfTypeOnType"} ->
+        :error
+
+      %{"errorCode" => "ErlangCompileError"} ->
         :error
 
       ###
