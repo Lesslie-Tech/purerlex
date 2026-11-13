@@ -12,9 +12,6 @@ defmodule Purserl do
 
   @build_cache_version 2
 
-  # Initial heap of each erlc process, in words (16 MB). erlc allocates heavily; this cut its time ~10% in measurements.
-  @erlc_min_heap_words 2_097_152
-
   def start(config) do
     case GenServer.start(__MODULE__, config, name: __MODULE__) do
       {:ok, pid} -> {:ok, pid}
@@ -351,7 +348,7 @@ defmodule Purserl do
             # calling erlang compiler on files as we go; purs will continue running in its own thread and we'll read its next output when we're done compiling this file. This hopefully and apparently speeds up erlang compilation.
             state = cond do
               path_to_changed_file |> String.ends_with?(".erl") ->
-                pid = :erlang.spawn_opt(__MODULE__, :compile_erlang, [path_to_changed_file, module_name, state.logfile], [:link, {:min_heap_size, @erlc_min_heap_words}])
+                pid = :erlang.spawn_link(__MODULE__, :compile_erlang, [path_to_changed_file, module_name, state.logfile])
                 %{ state | tasks: [pid|state.tasks] }
 
               true ->
