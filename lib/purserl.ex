@@ -2065,6 +2065,9 @@ defmodule Purserl do
       %{"errorCode" => "UnnecessaryFFIModule"} ->
         :error
 
+      %{"errorCode" => "UnnecessaryUnitDiscard"} ->
+        :error
+
       %{"errorCode" => "UnsupportedFFICommonJSExports"} ->
         :error
 
